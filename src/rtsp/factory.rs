@@ -1,5 +1,8 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -244,7 +247,8 @@ pub(super) async fn make_factory(
                         // This is not an async thread
                         std::thread::spawn(move || {
                             let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
+                            let stream_start = Instant::now();
+                            let mut last_vid_ts = Duration::ZERO;
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -254,9 +258,9 @@ pub(super) async fn make_factory(
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
+                                    stream_start,
+                                    &mut last_vid_ts,
                                     &mut aud_ts,
-                                    &stream_config,
                                 )?;
                             }
 
@@ -267,9 +271,9 @@ pub(super) async fn make_factory(
                                     &mut pools,
                                     &vid_src,
                                     &aud_src,
-                                    &mut vid_ts,
+                                    stream_start,
+                                    &mut last_vid_ts,
                                     &mut aud_ts,
-                                    &stream_config,
                                 );
                                 if let Err(r) = &r {
                                     log::info!("Failed to send to source: {r:?}");
@@ -304,9 +308,9 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
+    stream_start: Instant,
+    last_vid_ts: &mut Duration,
     aud_ts: &mut u32,
-    stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update TS
     match data {
@@ -340,12 +344,20 @@ fn send_to_sources(
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+            // Timestamp by real elapsed time since the stream started, not by an assumed
+            // nominal fps. The camera's actual frame cadence can drift from the fps reported
+            // in its stream info (especially on weaker/older hardware), and a guessed
+            // per-frame increment causes the served PTS to drift from real time, which
+            // RTSP clients then have to buffer around indefinitely to resync.
+            // Clamp to strictly-increasing so the initial burst of already-buffered frames
+            // (sent back-to-back before real-time pacing applies) doesn't produce duplicate
+            // timestamps.
+            let ts = std::cmp::max(stream_start.elapsed(), *last_vid_ts + Duration::from_micros(1));
+            *last_vid_ts = ts;
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                log::trace!("Sending VID: {:?}", ts);
+                send_to_appsrc(vid_src, data, ts, pools)?;
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
         }
         _ => {}
     }
