@@ -1,5 +1,9 @@
 use gstreamer::ClockTime;
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -10,7 +14,10 @@ use neolink_core::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+use tokio::{
+    sync::{broadcast, mpsc::channel as mpsc, watch},
+    task::JoinHandle,
+};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -150,137 +157,310 @@ enum ClientMsg {
     },
 }
 
+/// How long the camera stream is kept open after the last RTSP client has left
+const IDLE_GRACE: Duration = Duration::from_secs(30);
+/// How long a new client waits for the camera to deliver its first frames
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upper bound for the frames of one group of pictures that are kept for new clients
+const GOP_MAX_FRAMES: usize = 1000;
+/// Frames a slow client may lag behind before it has to resync on the next keyframe
+const BROADCAST_CAPACITY: usize = 1024;
+/// A client that has this many bytes queued is not reading: drop frames until the next keyframe
+const MAX_QUEUED_BYTES: u64 = 6 * 1024 * 1024;
+
+/// One frame of camera media that is shared between all RTSP clients
+struct HubFrame {
+    /// Increases every time the camera stream is (re)started
+    epoch: u64,
+    media: BcMedia,
+}
+
+impl HubFrame {
+    fn is_keyframe(&self) -> bool {
+        matches!(self.media, BcMedia::Iframe(_))
+    }
+}
+
+/// Lets a gstreamer buffer point at the shared frame, so no client has to copy it
+struct FrameData(Arc<HubFrame>);
+
+impl AsRef<[u8]> for FrameData {
+    fn as_ref(&self) -> &[u8] {
+        match &self.0.media {
+            BcMedia::Iframe(BcMediaIframe { data, .. })
+            | BcMedia::Pframe(BcMediaPframe { data, .. }) => data.as_slice(),
+            BcMedia::Aac(aac) => aac.data.as_slice(),
+            BcMedia::Adpcm(adpcm) => adpcm.data.as_slice(),
+            _ => &[],
+        }
+    }
+}
+
+/// The camera only sends one video stream per RTSP path, however many clients are watching
+///
+/// A camera such as the Reolink E1 cannot serve several video streams of the same kind at once:
+/// starting a second one cuts off the first. So there is exactly one camera stream, which
+/// this hub fans out to every RTSP client. It also keeps the last group of pictures, so a new
+/// client gets a keyframe straight away instead of waiting for the next one.
+struct Hub {
+    frames: broadcast::Sender<Arc<HubFrame>>,
+    gop: Mutex<Vec<Arc<HubFrame>>>,
+    config: watch::Sender<Option<StreamConfig>>,
+    clients: watch::Sender<usize>,
+}
+
+/// Keeps the camera stream running as long as it is alive
+struct ClientGuard(Arc<Hub>);
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0
+            .clients
+            .send_modify(|clients| *clients = clients.saturating_sub(1));
+    }
+}
+
+impl Hub {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            frames: broadcast::channel(BROADCAST_CAPACITY).0,
+            gop: Mutex::new(vec![]),
+            config: watch::channel(None).0,
+            clients: watch::channel(0).0,
+        })
+    }
+
+    fn join(self: &Arc<Self>) -> ClientGuard {
+        self.clients.send_modify(|clients| *clients += 1);
+        ClientGuard(self.clone())
+    }
+
+    async fn wait_config(&self) -> AnyResult<StreamConfig> {
+        let mut config = self.config.subscribe();
+        let config = config.wait_for(|config| config.is_some()).await?.clone();
+        config.ok_or_else(|| anyhow!("Camera stream config is missing"))
+    }
+
+    /// The frames since the last keyframe, and everything that is published after them
+    fn subscribe(&self) -> (Vec<Arc<HubFrame>>, broadcast::Receiver<Arc<HubFrame>>) {
+        let gop = self.gop.lock().unwrap();
+        (gop.clone(), self.frames.subscribe())
+    }
+
+    fn publish(&self, frame: Arc<HubFrame>) {
+        let mut gop = self.gop.lock().unwrap();
+        if frame.is_keyframe() {
+            gop.clear();
+            gop.push(frame.clone());
+        } else if !gop.is_empty() && gop.len() < GOP_MAX_FRAMES {
+            gop.push(frame.clone());
+        }
+        // Having no receiver is fine
+        let _ = self.frames.send(frame);
+    }
+
+    fn clear_gop(&self) {
+        self.gop.lock().unwrap().clear();
+    }
+}
+
+/// Waits until the number of clients satisfies `check`
+async fn wait_clients(
+    clients: &mut watch::Receiver<usize>,
+    check: impl Fn(usize) -> bool,
+) -> AnyResult<()> {
+    clients.wait_for(|clients| check(*clients)).await?;
+    Ok(())
+}
+
+/// Sleeps until the deadline, or forever when there is none
+async fn sleep_until_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Owns the one camera stream: starts it for the first client and stops it when it has been
+/// unused for a while
+async fn run_hub(hub: Arc<Hub>, camera: NeoInstance, stream: StreamKind) -> AnyResult<()> {
+    let name = camera.config().await?.borrow().name.clone();
+    let mut clients = hub.clients.subscribe();
+    let mut epoch = 0u64;
+    loop {
+        wait_clients(&mut clients, |clients| clients > 0).await?;
+        epoch += 1;
+        log::debug!("{name}::{stream}: Starting the camera stream");
+        let mut stream_config = StreamConfig::new(&camera, stream).await?;
+        let mut media_rx = camera.stream_while_live(stream).await?;
+        hub.clear_gop();
+
+        let mut learned = false;
+        let mut frame_count = 0usize;
+        let mut idle = false;
+        // The camera stream is always read, even when nobody is watching: a stream that
+        // is not read fills up the connection to the camera and blocks everything else on it
+        let mut idle_deadline =
+            (*clients.borrow_and_update() == 0).then(|| tokio::time::Instant::now() + IDLE_GRACE);
+        loop {
+            tokio::select! {
+                media = media_rx.recv() => {
+                    let Some(media) = media else {
+                        log::debug!("{name}::{stream}: The camera stream ended");
+                        break;
+                    };
+                    stream_config.update_from_media(&media);
+                    frame_count += 1;
+                    if !learned
+                        && (frame_count > 10
+                            || (stream_config.vid_type.is_some() && stream_config.aud_type.is_some()))
+                    {
+                        learned = true;
+                        hub.config.send_replace(Some(stream_config.clone()));
+                    }
+                    if matches!(
+                        media,
+                        BcMedia::Iframe(_) | BcMedia::Pframe(_) | BcMedia::Aac(_) | BcMedia::Adpcm(_)
+                    ) {
+                        hub.publish(Arc::new(HubFrame { epoch, media }));
+                    }
+                }
+                changed = clients.changed() => {
+                    changed?;
+                    // Give clients that are just reconnecting a chance to find the
+                    // stream still running
+                    idle_deadline = (*clients.borrow_and_update() == 0)
+                        .then(|| tokio::time::Instant::now() + IDLE_GRACE);
+                }
+                _ = sleep_until_deadline(idle_deadline) => {
+                    log::debug!("{name}::{stream}: Stopping the unused camera stream");
+                    idle = true;
+                    break;
+                }
+            }
+        }
+        drop(media_rx);
+        hub.clear_gop();
+        if !idle {
+            // The camera stream failed, try again shortly if someone is still watching
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
+    let hub = Hub::new();
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
+        let mut hub_task = tokio::task::spawn(run_hub(hub.clone(), camera.clone(), stream));
 
-        while let Some(msg) = client_rx.recv().await {
-            match msg {
-                ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
-                    let camera = camera.clone();
-                    let name = name.clone();
-                    tokio::task::spawn(async move {
-                        clear_bin(&element)?;
-                        log::trace!("{name}::{stream}: Starting camera");
+        let handle_clients = async {
+            while let Some(msg) = client_rx.recv().await {
+                match msg {
+                    ClientMsg::NewClient { element, reply } => {
+                        log::debug!("New client for {name}::{stream}");
+                        let camera = camera.clone();
+                        let hub = hub.clone();
+                        let name = name.clone();
+                        tokio::task::spawn(async move {
+                            clear_bin(&element)?;
+                            let guard = hub.join();
+                            let config = camera.config().await?.borrow().clone();
 
-                        // Start the camera
-                        let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
+                            log::trace!("{name}::{stream}: Waiting for the camera stream");
+                            let stream_config =
+                                tokio::time::timeout(CONFIG_TIMEOUT, hub.wait_config()).await??;
 
-                        log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
+                            log::trace!("{name}::{stream}: Building the pipeline");
+                            // Build the right video pipeline
+                            let vid_src = match stream_config.vid_type.as_ref() {
+                                Some(VideoType::H264) => {
+                                    let src = build_h264(&element, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                }
+                                Some(VideoType::H265) => {
+                                    let src = build_h265(&element, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                }
+                                None => {
+                                    build_unknown(&element, &config.splash_pattern.to_string())?;
+                                    AnyResult::Ok(None)
+                                }
+                            }?;
 
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                            // Build the right audio pipeline
+                            let aud_src = match stream_config.aud_type.as_ref() {
+                                Some(AudioType::Aac) => {
+                                    let src = build_aac(&element, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                }
+                                Some(AudioType::Adpcm(block_size)) => {
+                                    let src = build_adpcm(&element, *block_size, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                }
+                                None => AnyResult::Ok(None),
+                            }?;
+
+                            if let Some(app) = vid_src.as_ref() {
+                                app.set_callbacks(
+                                    AppSrcCallbacks::builder()
+                                        .seek_data(move |_, _seek_pos| true)
+                                        .build(),
+                                );
                             }
-                            frame_count += 1;
-                        }
-
-                        log::trace!("{name}::{stream}: Building the pipeline");
-                        // Build the right video pipeline
-                        let vid_src = match stream_config.vid_type.as_ref() {
-                            Some(VideoType::H264) => {
-                                let src = build_h264(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(VideoType::H265) => {
-                                let src = build_h265(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => {
-                                build_unknown(&element, &config.splash_pattern.to_string())?;
-                                AnyResult::Ok(None)
-                            }
-                        }?;
-
-                        // Build the right audio pipeline
-                        let aud_src = match stream_config.aud_type.as_ref() {
-                            Some(AudioType::Aac) => {
-                                let src = build_aac(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            Some(AudioType::Adpcm(block_size)) => {
-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
-                                AnyResult::Ok(Some(src))
-                            }
-                            None => AnyResult::Ok(None),
-                        }?;
-
-                        if let Some(app) = vid_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-                        if let Some(app) = aud_src.as_ref() {
-                            app.set_callbacks(
-                                AppSrcCallbacks::builder()
-                                    .seek_data(move |_, _seek_pos| true)
-                                    .build(),
-                            );
-                        }
-
-                        log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the factory so it can start
-                        let _ = reply.send(element);
-
-                        // Run blocking code on a seperate thread
-                        // This is not an async thread
-                        std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-
-                            log::trace!("{name}::{stream}: Sending buffered frames");
-                            for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                )?;
+                            if let Some(app) = aud_src.as_ref() {
+                                app.set_callbacks(
+                                    AppSrcCallbacks::builder()
+                                        .seek_data(move |_, _seek_pos| true)
+                                        .build(),
+                                );
                             }
 
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
+                            // Everything published from here on reaches this client
+                            let (gop, frames_rx) = hub.subscribe();
+
+                            log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
+                            // Send the pipeline back to the factory so it can start
+                            let _ = reply.send(element);
+
+                            // Run blocking code on a seperate thread
+                            // This is not an async thread
+                            std::thread::spawn(move || {
+                                let r = feed_client(
+                                    guard,
+                                    gop,
+                                    frames_rx,
+                                    vid_src,
+                                    aud_src,
                                     &stream_config,
                                 );
                                 if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                    log::debug!("{name}::{stream}: Client stopped: {r:?}");
                                 }
-                                r?;
-                            }
-                            log::trace!("All media recieved");
+                                r
+                            });
                             AnyResult::Ok(())
                         });
-                        AnyResult::Ok(())
-                    });
+                    }
                 }
             }
+            AnyResult::Ok(())
+        };
+
+        tokio::select! {
+            r = &mut hub_task => {
+                r??;
+            }
+            r = handle_clients => {
+                r?;
+            }
         }
+        hub_task.abort();
         AnyResult::Ok(())
     });
 
@@ -296,114 +476,135 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
-fn send_to_sources(
-    data: BcMedia,
-    vid_src: &Option<AppSrc>,
-    aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
-    stream_config: &StreamConfig,
-) -> AnyResult<()> {
-    // Update TS
-    match data {
-        BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
-            }
-            *aud_ts += duration;
-        }
-        BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
-            }
-            *aud_ts += duration;
-        }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
-            if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
-            }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
-        }
-        _ => {}
-    }
-    Ok(())
+/// Is the media of this appsrc up and able to take frames?
+fn pipeline_running(appsrc: Option<&AppSrc>) -> bool {
+    appsrc.is_some_and(|appsrc| {
+        matches!(
+            appsrc.current_state(),
+            gstreamer::State::Paused | gstreamer::State::Playing
+        )
+    })
 }
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
-    check_live(appsrc)?; // Stop if appsrc is dropped
+/// Sends the frames of the shared camera stream into the pipeline of one client
+///
+/// A pipeline can be stopped and started again by the RTSP server (that is what happens
+/// between DESCRIBE and PLAY). Frames that arrive while it is stopped are dropped, and
+/// after it started again nothing is sent until the next keyframe.
+fn feed_client(
+    _guard: ClientGuard,
+    gop: Vec<Arc<HubFrame>>,
+    mut frames_rx: broadcast::Receiver<Arc<HubFrame>>,
+    vid_src: Option<AppSrc>,
+    aud_src: Option<AppSrc>,
+    stream_config: &StreamConfig,
+) -> AnyResult<()> {
+    const MICROSECONDS: u32 = 1000000;
+    let vid_step = MICROSECONDS / stream_config.fps.max(1);
+    let probe = vid_src.as_ref().or(aud_src.as_ref());
 
-    // In live mode we follow the advice in
-    // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
-    // Only push buffers when in play state and have a clock
-    // we also timestamp at the current time
-    if appsrc.is_live() {
-        if let Some(time) = appsrc
-            .current_clock_time()
-            .and_then(|t| appsrc.base_time().map(|bt| t - bt))
-        {
-            if matches!(appsrc.current_state(), gstreamer::State::Playing) {
-                ts = Duration::from_micros(time.useconds());
-            } else {
-                // Not playing
-                return Ok(());
+    // The frames since the last keyframe let the pipeline start at once
+    let mut backlog: VecDeque<Arc<HubFrame>> = gop.into();
+    let mut started = false;
+    let mut epoch = None;
+    let mut vid_ts = 0u32;
+    let mut aud_ts = 0u32;
+    loop {
+        // Stop when the client has gone
+        if let Some(probe) = probe {
+            check_live(probe)?;
+        }
+        // Nothing can be pushed while the media is not running
+        if !pipeline_running(probe) {
+            started = false;
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        let frame = match backlog.pop_front() {
+            Some(frame) => frame,
+            None => match frames_rx.blocking_recv() {
+                Ok(frame) => frame,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    started = false;
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+        };
+
+        if epoch != Some(frame.epoch) {
+            // The camera stream has been restarted
+            epoch = Some(frame.epoch);
+            started = false;
+        }
+        if started && probe.is_some_and(|probe| probe.current_level_bytes() > MAX_QUEUED_BYTES) {
+            // This client is not reading
+            started = false;
+        }
+
+        let pushed = match &frame.media {
+            BcMedia::Iframe(_) | BcMedia::Pframe(_) => {
+                if frame.is_keyframe() && !started {
+                    started = true;
+                    vid_ts = 0;
+                    aud_ts = 0;
+                }
+                if started {
+                    let pushed = match vid_src.as_ref() {
+                        Some(vid_src) => push_frame(vid_src, &frame, vid_ts)?,
+                        None => true,
+                    };
+                    vid_ts += vid_step;
+                    pushed
+                } else {
+                    true
+                }
             }
-        } else {
-            // Clock not up yet
-            return Ok(());
+            BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
+                if started {
+                    let duration = match &frame.media {
+                        BcMedia::Aac(aac) => aac.duration(),
+                        BcMedia::Adpcm(adpcm) => adpcm.duration(),
+                        _ => None,
+                    }
+                    .unwrap_or(0);
+                    let pushed = match aud_src.as_ref() {
+                        Some(aud_src) => push_frame(aud_src, &frame, aud_ts)?,
+                        None => true,
+                    };
+                    aud_ts += duration;
+                    pushed
+                } else {
+                    true
+                }
+            }
+            _ => true,
+        };
+        if !pushed {
+            // The pipeline is not taking frames. Start over at the next keyframe
+            started = false;
         }
     }
-    // A plain buffer, not a pool: `BufferPool::acquire_buffer` blocks once the pool is
-    // exhausted, and the single feeder thread that serves video and audio would stall
-    // while the pipeline is prerolling, so the video keyframe never arrives.
-    let mut buf = gstreamer::Buffer::from_slice(data);
+}
+
+/// Pushes a frame into an appsrc. Returns false when the appsrc is not taking frames
+fn push_frame(appsrc: &AppSrc, frame: &Arc<HubFrame>, ts: u32) -> AnyResult<bool> {
+    check_live(appsrc)?; // Stop if appsrc is dropped
+
+    let mut buf = gstreamer::Buffer::from_slice(FrameData(frame.clone()));
     {
         let buf_mut = buf.get_mut().unwrap();
-        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        let time = ClockTime::from_useconds(ts as u64);
         buf_mut.set_dts(time);
         buf_mut.set_pts(time);
     }
 
-    // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
-        Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
-            Ok(())
-        }
+        Ok(_) => Ok(true),
+        Err(FlowError::Flushing) => Ok(false),
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
-    }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
     }
-    Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
