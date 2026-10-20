@@ -19,6 +19,8 @@ pub(crate) struct NeoCamThread {
     config: WatchReceiver<CameraConfig>,
     cancel: CancellationToken,
     camera_watch: WatchSender<Weak<BcCamera>>,
+    /// Set once a login has worked, so a later rejection is not taken for wrong credentials
+    logged_in_before: bool,
 }
 
 impl NeoCamThread {
@@ -33,12 +35,14 @@ impl NeoCamThread {
             config: watch_config_rx,
             cancel,
             camera_watch: camera_watch_tx,
+            logged_in_before: false,
         }
     }
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
         let name = config.name.clone();
         log::trace!("Attempting connection with config: {config:?}");
         let camera = Arc::new(connect_and_login(config).await?);
+        self.logged_in_before = true;
         log::trace!("  - Connected");
 
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
@@ -107,6 +111,7 @@ impl NeoCamThread {
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
         const MAX_BACKOFF: Duration = Duration::from_secs(5);
         const MIN_BACKOFF: Duration = Duration::from_millis(50);
+        const LOGIN_RETRY: Duration = Duration::from_secs(30);
 
         let mut backoff = MIN_BACKOFF;
 
@@ -168,11 +173,18 @@ impl NeoCamThread {
                     // Check if it is non-retry
                     let e_inner = e.downcast_ref::<neolink_core::Error>();
                     match e_inner {
-                        Some(neolink_core::Error::CameraLoginFail) => {
+                        Some(neolink_core::Error::CameraLoginFail) if !self.logged_in_before => {
                             // Fatal
                             log::error!("{name}: Login credentials were not accepted");
                             self.cancel.cancel();
                             return Err(e);
+                        }
+                        Some(neolink_core::Error::CameraLoginFail) => {
+                            // The credentials have worked before, so the camera is probably
+                            // just busy or restarting. Retry slowly so a camera that really
+                            // changed its password does not get locked out
+                            log::warn!("{name}: Login was rejected, retrying in {LOGIN_RETRY:?}");
+                            sleep(LOGIN_RETRY).await;
                         }
                         _ => {
                             // Non fatal

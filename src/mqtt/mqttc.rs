@@ -571,18 +571,14 @@ impl LastWillMqtt {
 
         tokio::task::spawn(async move {
             loop {
-                let r = tokio::select! {
-                    _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-                    v = connection.poll() =>  {
+                tokio::select! {
+                    // Once cancelled this stays ready, so it has to end the loop
+                    _ = thread_cancel.cancelled() => break,
+                    v = connection.poll() => {
                         v?;
-                        AnyResult::Ok(())
                     },
-                };
-                if r.is_ok() {
-                    continue;
                 }
-                break r;
-            }?;
+            }
             drop(client);
             AnyResult::Ok(())
         });
