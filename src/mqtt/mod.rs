@@ -133,7 +133,9 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                             let mqtt_instance = thread_instance.subscribe(name).await?;
                             let name = name.clone();
                             set.spawn(async move {
+                                let mut backoff = Duration::from_secs(1);
                                 loop {
+                                    let started = tokio::time::Instant::now();
                                     let camera = thread_reactor2.get(&name).await?;
                                     let mqtt_instance = mqtt_instance.resubscribe().await?;
                                     let r = tokio::select!{
@@ -147,10 +149,17 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                                             v
                                         },
                                     };
-                                    if let Ok(()) = &r {
-                                        break r
+                                    if let Err(e) = &r {
+                                        // Without a pause this spins at full CPU whenever the
+                                        // camera is gone for good and the task fails at once
+                                        if started.elapsed() > Duration::from_secs(60) {
+                                            backoff = Duration::from_secs(1);
+                                        }
+                                        log::warn!("{name}: MQTT camera task failed, restarting in {backoff:?}: {e:?}");
+                                        sleep(backoff).await;
+                                        backoff = (backoff * 2).min(Duration::from_secs(60));
                                     } else {
-                                        continue;
+                                        break r
                                     }
                                 }
                             }) ;
